@@ -1,11 +1,12 @@
 #include <Arduino.h>
 #include <configs.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // Actively used pins
 #define PGOOD 20 
 #define NRST 7 
 #define WARMRST 35
-#define READY_PIN 2 
 #define SOP_0 14
 #define SOP_1 36
 #define SOP_2 9
@@ -25,6 +26,7 @@
 #define MOSI 11
 #define CLK 12
 #define MISO 13
+#define AWR_IO2 2 
 
 // Global variables
 // TODO may need to manage with Mutex/Sephamore if multi-core processing is implemented
@@ -103,7 +105,7 @@ void radar_begin(const RADAR_CONFIG &config) {
   radarReset(0); // Hardware reset
   sendConfig(config);
 
-  xTaskCreate(checkSerialInput, "checkSerial", 2048, NULL, 1, &serialTaskHandle);
+  xTaskCreate(checkSerialInput, "checkSerial", 4096, NULL, 1, &serialTaskHandle);
   Serial.println("You may start sending commands to the MCU via Terminal/Serial Monitor.");
   String input = String("help");
   serialInputHandler(input);
@@ -122,33 +124,28 @@ bool sendCommand(const String &command, unsigned long timeout) {
   }
 
   Serial.print("Sending command: ");
-  Serial.print(command + "\n");
-  cliSerial.print(command + "\n");
+  Serial.println(command);
+  cliSerial.println(command);
 
   // Wait for confirmation
-  // TODO edit confirmation based on test results of CLI output
-  const String expected_confirmation = "confirmation";
+  static const String expected_response_1 = "Skipped";
+  static const String expected_response_2 = "Done";
   String response;
 
   unsigned long start_time = millis();
 
-  if (cliSerial.available()) {
-    response = cliSerial.readString();
+  while (response != expected_response_1 && response != expected_response_2) {
+    if (millis() - start_time > timeout && timeout > 0) {
+      Serial.println("Error: Timeout waiting for sendCommand confirmation.");
+      return false;
+    }
+
+    // while (!cliSerial.available()) {delay(1);}
+    response = cliSerial.readStringUntil('\n');
+    response.trim();
     Serial.println(response);
+    delay(10);
   }
-
-  // while (response != expected_confirmation) {
-  //   if (millis() - start_time > timeout && timeout > 0) {
-  //     Serial.println("Error: Timeout waiting for sendCommand confirmation.");
-  //     return true; // TODO change to false after confirming what CLI output looks like
-  //   }
-
-  //   // while (!cliSerial.available()) {delay(1);}
-  //   response = cliSerial.readString(); // TODO change to readStringUntil("\n") if CLI returns \n delimiter
-  //   // response.trim();
-  //   Serial.println(response);
-  //   delay(10);
-  // }
   return true;
 }
 
@@ -198,7 +195,7 @@ void sendConfig(const RADAR_CONFIG &cfg) {
 void startRadar() {
   Serial.println("startRadar called");
   if (radar_config) {
-    String command = "sensorStart";
+    String command = "sensorStart 0";
     while (!sendCommand(command)){delay(10);}
     Serial.println("Radar sensor started.");
   } else {
@@ -367,18 +364,18 @@ void setPinModes() {
   pinMode(PGOOD, INPUT); // PGOOD
   pinMode(NRST, OUTPUT_OPEN_DRAIN); // Radar hardware reset pin
   pinMode(WARMRST, OUTPUT_OPEN_DRAIN); // Radar software reset pin
-  pinMode(READY_PIN, INPUT); // AWR ready signal
   pinMode(SOP_0, OUTPUT);
   pinMode(SOP_1, OUTPUT);
   pinMode(SOP_2, OUTPUT);
 
   // Unused but connected pins (set as input to prevent floating)
+  pinMode(AWR_IO0, INPUT);
   pinMode(AWR_IO1, INPUT);
+  pinMode(AWR_IO2, INPUT);
   pinMode(HOSTINT, INPUT);
   pinMode(PMIC_EN, INPUT);
   pinMode(SYNC_OUT, INPUT);
   pinMode(SYNC_IN, INPUT);
-  pinMode(AWR_IO0, INPUT);
   pinMode(NERRIN, INPUT);
   pinMode(MISO, INPUT);
   pinMode(MOSI, INPUT);
