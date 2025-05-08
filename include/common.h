@@ -43,11 +43,12 @@ TaskHandle_t checkSerialTaskHandle = NULL;
 TaskHandle_t serialInputTaskHandle = NULL;
 TaskHandle_t parseConfigTaskHandle = NULL;
 TaskHandle_t dataLoggingTaskHandle = NULL;
+TaskHandle_t dataParsingTaskHandle = NULL;
 TaskHandle_t dataStreamingTaskHandle = NULL;
 
 struct configParamStruct {
   uint16_t numRangeBins;
-  float numDopplerBins;
+  uint16_t numDopplerBins;
   float rangeResolutionMeters;
   float rangeIdxToMeters;
   float dopplerResolutionMps;
@@ -91,8 +92,8 @@ HardwareSerial cliSerial(1);
 #define dataSerial_BUF_SIZE   (32768)
 #define FRAME_BUFFER_SIZE     32768
 #define FRAME_POOL_SIZE       4
-uint8_t framePool[FRAME_POOL_SIZE][FRAME_BUFFER_SIZE];
-Frame frameStructs[FRAME_POOL_SIZE];
-QueueHandle_t freeFrameQueue; // Available slots in framePool
-QueueHandle_t parseFrameQueue; // Frames ready to parse in framePool
-QueueHandle_t streamQueue; // Frames ready to stream out
+extern uint8_t framePool[FRAME_POOL_SIZE][FRAME_BUFFER_SIZE];
+extern Frame frameStructs[FRAME_POOL_SIZE];
+extern QueueHandle_t freeFrameQueue; // Available slots in framePool
+extern QueueHandle_t parseFrameQueue; // Frames ready to parse in framePool
+extern QueueHandle_t streamQueue; // Frames ready to stream out

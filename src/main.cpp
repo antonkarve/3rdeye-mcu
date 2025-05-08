@@ -1,5 +1,11 @@
 #include <common.h>
 
+uint8_t framePool[FRAME_POOL_SIZE][FRAME_BUFFER_SIZE];
+Frame frameStructs[FRAME_POOL_SIZE];
+QueueHandle_t freeFrameQueue; // Available slots in framePool
+QueueHandle_t parseFrameQueue; // Frames ready to parse in framePool
+QueueHandle_t streamQueue; // Frames ready to stream out
+
 // Setup function prototypes
 void radar_begin(const RADAR_CONFIG &config);
 void checkSerialInput(void * params);
@@ -16,6 +22,8 @@ void shiftBufferLeft(uint8_t* buffer, size_t& len, int processedBytes);
 
 void parseData(void * params);
 void parseDataFrame(uint8_t* data, size_t len, ProcessedFrame &processedFrame);
+void parseObj(uint8_t* data, int& idx, uint16_t xyzQformat, DetectedObject &object);
+void parseTLV(uint8_t* data, size_t len, int& idx, ProcessedFrame &processedFrame);
 void parseObj(uint8_t* data, int& idx, uint16_t xyzQformat, DetectedObject &object);
 
 void parseConfig(const RADAR_CONFIG &cfg);
@@ -35,21 +43,81 @@ void radarReset(uint8_t reset_type);
 void cliTest();
 void serialInputHandler(void * pvParameters);
 void streamData(void * params);
+void radar_test(const RADAR_CONFIG &config);
+void simulateDataStream(void * params);
+
+bool stop_test = false;
 
 void setup() {
   Serial.begin(115200);
   debugSerial.begin(115200);
   const RADAR_CONFIG &cfg = default_config;
   radar_test(default_config);
+
   // cliTest();
 }
 
 void loop() {}
 
+void radar_test(const RADAR_CONFIG &config) {
+  if (stop_test) {
+    Serial.print("Hello! USB");
+    debugSerial.print("Hello! UART");
+    return;
+  }
+
+  debugSerial.println("radar_test called");
+  setPinModes();
+  current_config = config;
+
+  xTaskCreate(parseConfigTask, "parseConfig", 4096, NULL, 1, &parseConfigTaskHandle);
+  while (!configParams.numRangeBins) {delay(10);}
+
+  // Create data frame queues and fill freeFrameQueue with pointers to frame pool slots
+  freeFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
+  parseFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
+  streamQueue = xQueueCreate(5, sizeof(ProcessedFrame*));
+
+  if (freeFrameQueue == nullptr) {
+    debugSerial.println("[init] Error: freeFrameQueue not initialized");
+  }
+
+  for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+    frameStructs[i].data = framePool[i];
+    // memset(framePool[i], 0xAA, FRAME_BUFFER_SIZE);
+    frameStructs[i].length = 0;
+    Frame* ptr = &frameStructs[i]; // THE CULPRIT
+    if (xQueueSend(freeFrameQueue, &ptr, 0) != pdPASS) {
+      debugSerial.printf("Failed to enqueue frameStructs[%d]\n", i);
+      continue;
+    }
+    debugSerial.printf("[init] frameStructs[%d]: %p, framePool data: %p\n", i, &frameStructs[i], framePool[i]);
+  }
+
+  for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+    if (frameStructs[i].data == NULL) {
+      debugSerial.printf("Init error: frameStructs[%d].data is NULL\n", i);
+    }
+  }
+
+  debugSerial.println("Creating parseData and streamData tasks");
+  xTaskCreatePinnedToCore(parseData, "parseData", 5120, NULL, 2, &dataParsingTaskHandle, 1); // I'm sorry i ever doubted you
+  xTaskCreatePinnedToCore(streamData, "streamData", 3072, NULL, 1, &dataStreamingTaskHandle, 1);
+
+  delay(100);
+
+  debugSerial.println("Starting data stream...");
+  xTaskCreatePinnedToCore(simulateDataStream, "simStream", 4096, NULL, 1, NULL, 0);
+  // simulateDataStream();
+}
+
 void streamData(void * params) {
+  debugSerial.println("streamData started");
+  Serial.println("streamData started");
   while (true) {
-    ProcessedFrame *frame;
+    ProcessedFrame* frame;
     if (xQueueReceive(streamQueue, &frame, portMAX_DELAY)) {
+      debugSerial.printf("[streamData] FRAME,%lu,%lu,%lu\n", frame->subFrameNum, frame->timeCpuCycles, frame->numDetectedObj);
       Serial.printf("FRAME,%lu,%lu,%lu\n", frame->subFrameNum, frame->timeCpuCycles, frame->numDetectedObj);
 
       for (uint32_t i = 0; i < frame->numDetectedObj; ++i) {
@@ -63,11 +131,17 @@ void streamData(void * params) {
           obj.z
         );
       }
+      delete frame;
+    } else {
+      debugSerial.println("streamData failed to receive from streamQueue");
     }
+    UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+    debugSerial.printf("streamData stack remaining: %u bytes\n", watermark * sizeof(StackType_t));
   }
 }
 
 void parseData(void * params) {
+  debugSerial.println("parseData started");
   while (true) {
     Frame* framePtr;
 
@@ -78,10 +152,24 @@ void parseData(void * params) {
       parseDataFrame(data, len, processedFrame);
 
       // Return raw data frame to freeFrameQueue
-      xQueueSend(freeFrameQueue, &framePtr, portMAX_DELAY);
+      if (framePtr->data == NULL) {
+        debugSerial.println("Warning [parseData]: framePtr->data is NULL before enqueue");
+      }
 
-      // Send processed frame to streamQueue
-      xQueueSend(streamQueue, &processedFrame, portMAX_DELAY);
+      xQueueSend(freeFrameQueue, &framePtr, portMAX_DELAY);
+      debugSerial.println("[parseData] Enqueued framePtr into freeFrameQueue");
+
+      // Copy processed frame and send to streamQueue
+      ProcessedFrame* frameCopy = new ProcessedFrame(processedFrame); // Copy contents
+      if (frameCopy->objects == NULL) {
+        debugSerial.println("Warning [parseData]: frameCopy->objects is NULL before enqueue");
+      }
+      xQueueSend(streamQueue, &frameCopy, portMAX_DELAY);
+      debugSerial.println("[parseData] Enqueued frameCopy into streamQueue");
+      UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+      debugSerial.printf("parseData stack remaining: %u bytes\n", watermark * sizeof(StackType_t));
+    } else {
+      debugSerial.println("parseData failed to receive from parseFrameQueue");
     }
     delay(1);
   }
@@ -135,6 +223,7 @@ void parseDataFrame(uint8_t* data, size_t len, ProcessedFrame &processedFrame) {
 }
 
 void parseTLV(uint8_t* data, size_t len, int& idx, ProcessedFrame &processedFrame) {
+  debugSerial.println("parseTLV called");
   uint16_t tlv_numObj, tlv_xyzQFormat;
   DetectedObject* objectList = processedFrame.objects;
 
@@ -149,6 +238,7 @@ void parseTLV(uint8_t* data, size_t len, int& idx, ProcessedFrame &processedFram
 }
 
 void parseObj(uint8_t* data, int& idx, uint16_t xyzQformat, DetectedObject &object) {
+  debugSerial.println("parseObj called");
   int16_t rangeIdx, dopplerIdx, x, y, z;
 
   // Parse raw object data
@@ -172,6 +262,72 @@ void parseObj(uint8_t* data, int& idx, uint16_t xyzQformat, DetectedObject &obje
   object.x = x / xyzQformat;
   object.y = y / xyzQformat;
   object.z = z / xyzQformat;
+}
+
+void simulateDataStream(void * params) {
+  debugSerial.println("simulateDataStream called");
+  const int chunkSize = 256;
+  static uint8_t radar_rx_buf[dataSerial_BUF_SIZE];
+  static size_t radar_rx_len = 0;
+  int testidx = 0;
+
+  const int totalLen = sizeof(testDataStream);
+  int offset = 0;
+
+  while (offset < totalLen) {
+    size_t len = min(chunkSize, totalLen - offset);
+    // debugSerial.printf("[simulateDataStream] len: %d, radar_rx_len: %d, offset: %d\n",len, radar_rx_len, offset);
+
+    memcpy(radar_rx_buf + radar_rx_len, testDataStream + offset, len);
+    radar_rx_len += len;
+    offset += len;
+
+    int startIdx = findMagicWord(radar_rx_buf, radar_rx_len);
+    if (startIdx >= 0 && radar_rx_len - startIdx >= 16) {
+
+      uint32_t totalPacketLen = bytesToUint32(radar_rx_buf + startIdx + 12);
+      // debugSerial.print("Frame packet len: ");
+      // debugSerial.println(totalPacketLen);
+
+      if (radar_rx_len - startIdx >= totalPacketLen) {
+        Frame* bufferPtr;
+        if (xQueueReceive(freeFrameQueue, &bufferPtr, portMAX_DELAY)) {
+          debugSerial.printf("[simulateDataStream] received bufferPtr: %p\n", bufferPtr);
+          debugSerial.printf("[simulateDataStream] First byte of bufferPtr: 0x%02X\n", bufferPtr->data[0]);
+          if (bufferPtr == nullptr) {
+            debugSerial.println("[simulateDataStream] Error: bufferPtr is NULL");
+            continue;
+          }
+          if (bufferPtr->data == nullptr) {
+            debugSerial.println("[simulateDataStream] Error: bufferPtr->data is NULL");
+            continue;
+          }
+          if (totalPacketLen > FRAME_BUFFER_SIZE) {
+            debugSerial.printf("Error: totalPacketLen (%u) exceeds buffer size!\n", totalPacketLen);
+            continue;
+          }
+          memcpy(bufferPtr->data, radar_rx_buf + startIdx, totalPacketLen);
+          bufferPtr->length = totalPacketLen;
+          if (bufferPtr->data == NULL) {
+            debugSerial.println("[simulateDataStream] Warning: bufferPtr->data is NULL before enqueue");
+          }
+          xQueueSend(parseFrameQueue, &bufferPtr, portMAX_DELAY);
+          debugSerial.printf("[simulateDataStream] Enqueued bufferPtr. testidx: %d\n", testidx);
+          testidx += 1;
+
+          debugSerial.printf("[simulateDataStream] Pre-shift: startIdx: %d, totalPacketLen: %d, radar_rx_len: %d\n", startIdx, totalPacketLen, radar_rx_len);
+          shiftBufferLeft(radar_rx_buf, radar_rx_len, startIdx + totalPacketLen);
+          debugSerial.printf("[simulateDataStream] Post-shift: startIdx: %d, totalPacketLen: %d, radar_rx_len: %d\n", startIdx, totalPacketLen, radar_rx_len);
+        } else {
+          debugSerial.println("simulateDataStream failed to receive from freeFrameQueue");
+        }
+      }
+    }
+
+    delay(1);  // Optional: mimic real-world UART pacing
+  }
+  debugSerial.println("Simulation done. Self-deleting");
+  vTaskDelete(NULL);
 }
 
 // Checks for magic word, gets packet length, copies complete radar frames into buffer pool
@@ -201,6 +357,8 @@ void mssHandler(void * params) {
             memcpy(bufferPtr->data, radar_rx_buf + startIdx, totalPacketLen);
             bufferPtr->length = totalPacketLen;
             xQueueSend(parseFrameQueue, &bufferPtr, portMAX_DELAY);
+          } else {
+            debugSerial.println("mssHandler failed to receive from freeFrameQueue");
           }
         }
       }
@@ -231,10 +389,14 @@ int16_t bytesToSignedInt16(const uint8_t* byte_array) {
 // Helper function for mssHandler
 // Searches through given buffer array for magic word
 int findMagicWord(const uint8_t* buffer, size_t length) {
+  debugSerial.println("findMagicWord called");
   const uint8_t magicWord[8] = {2,1,4,3,6,5,8,7};
   if (length < 8) {return -1;}
   for (size_t i = 0; i <= length-8; ++i) {
     if (memcmp(&buffer[i], magicWord, 8) == 0) {
+      debugSerial.printf("Magic word found at index %d: %02X %02X %02X %02X %02X %02X %02X %02X\n", 
+        i, buffer[i], buffer[i+1], buffer[i+2], buffer[i+3],
+        buffer[i+4], buffer[i+5], buffer[i+6], buffer[i+7]);
       return i;
     }
     delay(1);
@@ -242,7 +404,9 @@ int findMagicWord(const uint8_t* buffer, size_t length) {
   return -1;
 }
 
+// Copies everything after buffer[processedBytes] to buffer[0]
 void shiftBufferLeft(uint8_t* buffer, size_t& len, int processedBytes) {
+  debugSerial.println("shiftBufferLeft called");
   if (processedBytes < len) {
     size_t remaining = len - processedBytes;
     memmove(buffer, buffer + processedBytes, remaining);
@@ -275,37 +439,6 @@ void cliTest() {
   delay(1000);
 }
 
-void radar_test(const RADAR_CONFIG &config) {
-  debugSerial.println("radar_test called");
-  setPinModes();
-  current_config = config;
-
-  xTaskCreate(parseConfigTask, "parseConfig", 8192, NULL, 1, &parseConfigTaskHandle);
-
-  // // Create data frame queues and fill freeFrameQueue with pointers to frame pool slots
-  // freeFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
-  // parseFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
-  // streamQueue = xQueueCreate(5, sizeof(ProcessedFrame*));
-
-  // for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-  //   frameStructs[i].data = framePool[i];
-  //   frameStructs[i].length = 0;
-  //   xQueueSend(freeFrameQueue, &frameStructs[i], 0);
-  // }
-  const unsigned long start_time = millis();
-  while (!configParams.numRangeBins) {delay(1);}
-  debugSerial.print("parseConfigTask time: ");
-  debugSerial.println(millis() - start_time);
-  debugSerial.printf("numRangeBins %d, numDopplerBins %f, rangeResolutionMeters %f, \nrangeIdxTometers %f, dopplerResolutionMps %f, maxRange %f, maxVelocity%f\n", 
-    configParams.numRangeBins,
-    configParams.numDopplerBins,
-    configParams.rangeResolutionMeters,
-    configParams.rangeIdxToMeters,
-    configParams.dopplerResolutionMps,
-    configParams.maxRange,
-    configParams.maxVelocity
-  );
-}
 
 void radar_begin(const RADAR_CONFIG &config) {
   debugSerial.println("radar_begin called");
@@ -317,12 +450,13 @@ void radar_begin(const RADAR_CONFIG &config) {
   // Create data frame queues and fill freeFrameQueue with pointers to frame pool slots
   freeFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
   parseFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
-  streamQueue = xQueueCreate(5, sizeof(ProcessedFrame*));
+  streamQueue = xQueueCreate(5, sizeof(ProcessedFrame));
 
   for (int i = 0; i < FRAME_POOL_SIZE; i++) {
     frameStructs[i].data = framePool[i];
     frameStructs[i].length = 0;
-    xQueueSend(freeFrameQueue, &frameStructs[i], 0);
+    Frame* frameStructsPtr = &frameStructs[i];
+    xQueueSend(freeFrameQueue, frameStructsPtr, 0);
   }
 
   // Set up Serial lines
@@ -441,7 +575,11 @@ void sendConfig(const RADAR_CONFIG &cfg) {
 
 // Runs parseConfig, deletes task after done
 void parseConfigTask(void * params) {
+  debugSerial.println("parseConfig called");
   parseConfig(current_config);
+  UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+  debugSerial.printf("parseConfig stack remaining: %u bytes\n", watermark * sizeof(StackType_t));
+  debugSerial.println("Config parsed.");
   vTaskDelete(NULL);
 }
 
@@ -472,22 +610,36 @@ void parseConfig(const RADAR_CONFIG &cfg) {
     configLine.trim();
 
     if (configLine.startsWith("profileCfg")) {
+      // debugSerial.println("Found profileCfg line.");
       parseConfigLine(configLine, 0, cfgIntArr, cfgFloatArr);
     }
     else if (configLine.startsWith("frameCfg")) {
+      // debugSerial.println("Found frameCfg line.");
       parseConfigLine(configLine, 1, cfgIntArr, cfgFloatArr);
     }
     
     startidx = endidx + 1;
     delay(1);
   }
+  // debugSerial.println("Printing filled int array:");
+  // for (uint8_t i = 0; i < 8; ++i) {
+  //   debugSerial.print(cfgIntArr[i]);
+  //   debugSerial.print(",");
+  // }
+  // delay(10);
+  // debugSerial.println("\nPrinting filled float array:");
+  // for (uint8_t i = 0; i < 4; ++i) {
+  //   debugSerial.print(cfgFloatArr[i]);
+  //   debugSerial.print(",");
+  // }
   calcConfigParams(cfgIntArr, cfgFloatArr);
 }
 
 // Parses individual config line and loads data into int/float arrays. Called by parseConfig
 void parseConfigLine(const String &configLine, uint8_t cfgType, int (&intarr)[8], float (&fltarr)[4]) {
   // Based on RPi implementation for mmWave SDK 2
-  
+  // debugSerial.print("Parsing: ");
+  // debugSerial.println(configLine);
   // Profile config variables
   uint16_t startFreq, idleTime, numAdcSamples, digOutSampleRate;
   float rampEndTime, freqSlopeConst;
@@ -502,8 +654,9 @@ void parseConfigLine(const String &configLine, uint8_t cfgType, int (&intarr)[8]
     int endIdx = 0;
 
     for (uint8_t i = 0; i < 12; i++) {
-      endIdx = configLine.indexOf(" ", startIdx) - 1;
-      if (i == 2) {startFreq = configLine.substring(startIdx, endIdx).toInt();}
+      endIdx = configLine.indexOf(" ", startIdx);
+      if (i == 2) {debugSerial.println(configLine.substring(startIdx, endIdx));
+        startFreq = configLine.substring(startIdx, endIdx).toInt();}
       else if (i == 3) {idleTime = configLine.substring(startIdx, endIdx).toInt();}
       else if (i == 5) {rampEndTime = configLine.substring(startIdx, endIdx).toFloat();}
       else if (i == 8) {freqSlopeConst = configLine.substring(startIdx, endIdx).toFloat();}
@@ -518,6 +671,8 @@ void parseConfigLine(const String &configLine, uint8_t cfgType, int (&intarr)[8]
     }
 
     // Load into arrays
+    // debugSerial.printf("startFreq %d, idleTime %d, numAdcSamples %d, numAdcSamplesRoundTo2 %d, digOutSampleRate %d, rampEndTime %f, freqSlopeConst %f\n",
+    //   startFreq, idleTime, numAdcSamples, numAdcSamplesRoundTo2, digOutSampleRate, rampEndTime, freqSlopeConst);
     intarr[0] = startFreq;
     intarr[1] = idleTime;
     intarr[2] = numAdcSamples;
@@ -532,7 +687,7 @@ void parseConfigLine(const String &configLine, uint8_t cfgType, int (&intarr)[8]
     int startIdx = 0;
     int endIdx = 0;
     for (uint8_t i = 0; i < 6; i++) {
-      endIdx = configLine.indexOf(" ", startIdx) - 1;
+      endIdx = configLine.indexOf(" ", startIdx);
       if (i == 1) {chirpStartIdx = configLine.substring(startIdx, endIdx).toInt();}
       else if (i == 2) {chirpEndIdx = configLine.substring(startIdx, endIdx).toInt();}
       else if (i == 3) {numLoops = configLine.substring(startIdx, endIdx).toFloat();}
