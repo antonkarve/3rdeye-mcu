@@ -8,12 +8,14 @@ QueueHandle_t streamQueue; // Frames ready to stream out
 
 // Setup function prototypes
 void radar_begin(const RADAR_CONFIG &config);
+void directStreamingRadarBegin(const RADAR_CONFIG &config);
 void checkSerialInput(void * params);
 void checkRadarState();
 void setPinModes();
 
 // Data function prototypes
 void mssHandler(void * params);
+void mssHandlerDirectStreaming(void * params);
 uint16_t bytesToUint16(const uint8_t* byte_array);
 uint32_t bytesToUint32(const uint8_t* byte_array);
 int16_t bytesToSignedInt16(const uint8_t* byte_array);
@@ -41,7 +43,7 @@ void startRadar();
 void stopRadar(bool flushCfg = false);
 void radarReset(uint8_t reset_type);
 void cliTest();
-void serialInputHandler(void * pvParameters);
+void serialInputHandler(String &input);
 void streamData(void * params);
 void radar_test(const RADAR_CONFIG &config);
 void simulateDataStream(void * params);
@@ -52,84 +54,146 @@ void setup() {
   Serial.begin(115200);
   debugSerial.begin(115200);
   const RADAR_CONFIG &cfg = default_config;
-  radar_test(default_config);
-
+  // radar_test(default_config);
+  directStreamingRadarBegin(cfg);
   // cliTest();
 }
 
-void loop() {}
+void loop() {
+  // debugSerial.printf("Minimum ever free heap: %u bytes\n", esp_get_minimum_free_heap_size());
+  // delay(1000);
+}
 
-void radar_test(const RADAR_CONFIG &config) {
-  if (stop_test) {
-    Serial.print("Hello! USB");
-    debugSerial.print("Hello! UART");
-    return;
-  }
-
-  debugSerial.println("radar_test called");
+void directStreamingRadarBegin(const RADAR_CONFIG &config) {
+  debugSerial.println("radar_begin called");
   setPinModes();
+
   current_config = config;
 
-  xTaskCreate(parseConfigTask, "parseConfig", 4096, NULL, 1, &parseConfigTaskHandle);
-  while (!configParams.numRangeBins) {delay(10);}
+  // Set up Serial lines
+  debugSerial.println("Setting up cliSerial");
+  cliSerial.begin(115200, SERIAL_8N1, CLI_RX, CLI_TX);
 
-  // Create data frame queues and fill freeFrameQueue with pointers to frame pool slots
-  freeFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
-  parseFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
-  streamQueue = xQueueCreate(5, sizeof(ProcessedFrame*));
+  // Setup dataSerial with ESP-IDF to take advantage of DMA-backed RX
+  uart_config_t dataSerial_config = {
+    .baud_rate = 921600,
+    .data_bits = UART_DATA_8_BITS,
+    .parity = UART_PARITY_DISABLE,
+    .stop_bits = UART_STOP_BITS_1,
+    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+  };
 
-  if (freeFrameQueue == nullptr) {
-    debugSerial.println("[init] Error: freeFrameQueue not initialized");
-  }
+  debugSerial.println("Setting up dataSerial");
+  uart_param_config(dataSerial, &dataSerial_config);
+  uart_set_pin(dataSerial, UART_PIN_NO_CHANGE, dataSerial_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  uart_driver_install(dataSerial, dataSerial_BUF_SIZE, 0, 0, NULL, 0);
 
-  for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-    frameStructs[i].data = framePool[i];
-    // memset(framePool[i], 0xAA, FRAME_BUFFER_SIZE);
-    frameStructs[i].length = 0;
-    Frame* ptr = &frameStructs[i]; // THE CULPRIT
-    if (xQueueSend(freeFrameQueue, &ptr, 0) != pdPASS) {
-      debugSerial.printf("Failed to enqueue frameStructs[%d]\n", i);
-      continue;
-    }
-    debugSerial.printf("[init] frameStructs[%d]: %p, framePool data: %p\n", i, &frameStructs[i], framePool[i]);
-  }
+  debugSerial.println("Initialised -- cliSerial: 115200, dataSerial: 921600");
+  delay(1000);
 
-  for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-    if (frameStructs[i].data == NULL) {
-      debugSerial.printf("Init error: frameStructs[%d].data is NULL\n", i);
-    }
-  }
+  // Set radar board to functional mode
+  digitalWrite(SOP_0, LOW);
+  digitalWrite(SOP_1, LOW);
+  digitalWrite(SOP_2, HIGH);
+  
+  xTaskCreate(checkSerialInput, "checkSerialInput", 4096, NULL, 1, &checkSerialTaskHandle);
+  
+  xTaskCreate(mssHandlerDirectStreaming, "mssHandler", 8192, NULL, 4, &dataLoggingTaskHandle);
+ 
+  delay(100); // Wait for tasks to fully initialise
 
-  debugSerial.println("Creating parseData and streamData tasks");
-  xTaskCreatePinnedToCore(parseData, "parseData", 5120, NULL, 2, &dataParsingTaskHandle, 1); // I'm sorry i ever doubted you
-  xTaskCreatePinnedToCore(streamData, "streamData", 3072, NULL, 1, &dataStreamingTaskHandle, 1);
-
-  delay(100);
-
-  debugSerial.println("Starting data stream...");
-  xTaskCreatePinnedToCore(simulateDataStream, "simStream", 4096, NULL, 1, NULL, 0);
-  // simulateDataStream();
+  debugSerial.println("Resetting radar...");
+  radarReset(0); // Hardware reset
+  sendConfig(config);
+  debugSerial.println("You may start sending commands to the MCU via Terminal/Serial Monitor. Type 'help' for the commands list.");
 }
+
+// void radar_test(const RADAR_CONFIG &config) {
+//   if (stop_test) {
+//     Serial.print("Hello! USB");
+//     debugSerial.print("Hello! UART");
+//     return;
+//   }
+
+//   debugSerial.println("radar_test called");
+//   setPinModes();
+//   current_config = config;
+
+//   xTaskCreate(parseConfigTask, "parseConfig", 4096, NULL, 1, &parseConfigTaskHandle);
+//   while (!configParams.numRangeBins) {delay(10);}
+
+//   // Create data frame queues and fill freeFrameQueue with pointers to frame pool slots
+//   freeFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
+//   parseFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
+//   streamQueue = xQueueCreate(5, sizeof(ProcessedFrame*));
+
+//   if (freeFrameQueue == nullptr) {
+//     debugSerial.println("[init] Error: freeFrameQueue not initialized");
+//   }
+
+//   for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+//     frameStructs[i].data = framePool[i];
+//     // memset(framePool[i], 0xAA, FRAME_BUFFER_SIZE);
+//     frameStructs[i].length = 0;
+//     Frame* ptr = &frameStructs[i]; // THE CULPRIT
+//     if (xQueueSend(freeFrameQueue, &ptr, 0) != pdPASS) {
+//       debugSerial.printf("Failed to enqueue frameStructs[%d]\n", i);
+//       continue;
+//     }
+//     debugSerial.printf("[init] frameStructs[%d]: %p, framePool data: %p\n", i, &frameStructs[i], framePool[i]);
+//   }
+
+//   for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+//     if (frameStructs[i].data == NULL) {
+//       debugSerial.printf("Init error: frameStructs[%d].data is NULL\n", i);
+//     }
+//   }
+
+//   debugSerial.println("Creating parseData and streamData tasks");
+//   xTaskCreatePinnedToCore(parseData, "parseData", 5120, NULL, 2, &dataParsingTaskHandle, 1); // I'm sorry i ever doubted you
+//   xTaskCreatePinnedToCore(streamData, "streamData", 3072, NULL, 1, &dataStreamingTaskHandle, 1);
+
+//   delay(100);
+
+//   debugSerial.println("Starting data stream...");
+//   xTaskCreatePinnedToCore(simulateDataStream, "simStream", 4096, NULL, 1, NULL, 0);
+//   // simulateDataStream();
+// }
 
 void streamData(void * params) {
   debugSerial.println("streamData started");
   Serial.println("streamData started");
   while (true) {
-    ProcessedFrame* frame;
+    ProcessedFrame* frame = nullptr;
     if (xQueueReceive(streamQueue, &frame, portMAX_DELAY)) {
-      debugSerial.printf("[streamData] FRAME,%lu,%lu,%lu\n", frame->subFrameNum, frame->timeCpuCycles, frame->numDetectedObj);
-      Serial.printf("FRAME,%lu,%lu,%lu\n", frame->subFrameNum, frame->timeCpuCycles, frame->numDetectedObj);
-
+      debugSerial.printf("[streamData] Received frameCopy at %p\n", frame);
+      if (frame == nullptr) {
+        debugSerial.println("[streamData] Warning: received null ProcessedFrame pointer");
+        continue;
+      }
+      if (frame->numDetectedObj > 128) {
+        debugSerial.println("[streamData] Warning: numDetectedObj > 128");
+        continue;
+      }
+      if (frame->objects == nullptr) {
+        debugSerial.println("[streamData] Warning: objects == nullptr");
+        continue;
+      }
+       
+      // debugSerial.printf("[streamData] FRAME,%lu,%lu,%lu\n", frame->subFrameNum, frame->timeCpuCycles, frame->numDetectedObj);
+      // Serial.printf("FRAME,%lu,%lu,%lu\n", frame->subFrameNum, frame->timeCpuCycles, frame->numDetectedObj);
+      Serial.println("Got a valid frame");
       for (uint32_t i = 0; i < frame->numDetectedObj; ++i) {
-        const DetectedObject &obj = frame->objects[i];
-        Serial.printf("OBJ,%d,%d,%d,%d,%d,%d\n",
-          obj.rangeVal,
-          obj.dopplerVal,
-          obj.peakVal,
-          obj.x,
-          obj.y,
-          obj.z
-        );
+        delay(1);
+        // const DetectedObject &obj = frame->objects[i];
+        // Serial.printf("OBJ,%d,%d,%d,%d,%d,%d\n",
+        //   obj.rangeVal,
+        //   obj.dopplerVal,
+        //   obj.peakVal,
+        //   obj.x,
+        //   obj.y,
+        //   obj.z
+        // );
       }
       delete frame;
     } else {
@@ -146,6 +210,7 @@ void parseData(void * params) {
     Frame* framePtr;
 
     if (xQueueReceive(parseFrameQueue, &framePtr, portMAX_DELAY)) {
+      debugSerial.println("[parseData]: received framePtr from parseFrameQueue");
       ProcessedFrame processedFrame;
       uint8_t* data = framePtr->data;
       size_t len = framePtr->length;
@@ -157,17 +222,24 @@ void parseData(void * params) {
       }
 
       xQueueSend(freeFrameQueue, &framePtr, portMAX_DELAY);
-      debugSerial.println("[parseData] Enqueued framePtr into freeFrameQueue");
+      debugSerial.println("[parseData] Sent framePtr into freeFrameQueue");
 
       // Copy processed frame and send to streamQueue
       ProcessedFrame* frameCopy = new ProcessedFrame(processedFrame); // Copy contents
-      if (frameCopy->objects == NULL) {
+      debugSerial.printf("[parseData] Created frameCopy at %p, size: %u\n", frameCopy, sizeof(ProcessedFrame));
+      if (!frameCopy) {
+        debugSerial.println("[parseData] Error: failed to allocate memory for ProcessedFrame");
+        continue;
+      } else if (frameCopy->objects == NULL) {
         debugSerial.println("Warning [parseData]: frameCopy->objects is NULL before enqueue");
+        continue;
+      } else if (frameCopy->numDetectedObj > 128) {
+        debugSerial.println("[parseData] Error: numDetectedObj is larger than object array");
+        continue;
       }
       xQueueSend(streamQueue, &frameCopy, portMAX_DELAY);
-      debugSerial.println("[parseData] Enqueued frameCopy into streamQueue");
-      UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
-      debugSerial.printf("parseData stack remaining: %u bytes\n", watermark * sizeof(StackType_t));
+      debugSerial.println("[parseData] Sent frameCopy into streamQueue");
+      debugSerial.printf("parseData stack left: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
     } else {
       debugSerial.println("parseData failed to receive from parseFrameQueue");
     }
@@ -223,7 +295,7 @@ void parseDataFrame(uint8_t* data, size_t len, ProcessedFrame &processedFrame) {
 }
 
 void parseTLV(uint8_t* data, size_t len, int& idx, ProcessedFrame &processedFrame) {
-  debugSerial.println("parseTLV called");
+  // debugSerial.println("parseTLV called");
   uint16_t tlv_numObj, tlv_xyzQFormat;
   DetectedObject* objectList = processedFrame.objects;
 
@@ -238,7 +310,7 @@ void parseTLV(uint8_t* data, size_t len, int& idx, ProcessedFrame &processedFram
 }
 
 void parseObj(uint8_t* data, int& idx, uint16_t xyzQformat, DetectedObject &object) {
-  debugSerial.println("parseObj called");
+  // debugSerial.println("parseObj called");
   int16_t rangeIdx, dopplerIdx, x, y, z;
 
   // Parse raw object data
@@ -264,70 +336,95 @@ void parseObj(uint8_t* data, int& idx, uint16_t xyzQformat, DetectedObject &obje
   object.z = z / xyzQformat;
 }
 
-void simulateDataStream(void * params) {
-  debugSerial.println("simulateDataStream called");
-  const int chunkSize = 256;
+// void simulateDataStream(void * params) {
+//   debugSerial.println("simulateDataStream called");
+//   const int chunkSize = 256;
+//   static uint8_t radar_rx_buf[dataSerial_BUF_SIZE];
+//   static size_t radar_rx_len = 0;
+//   int testidx = 0;
+
+//   const int totalLen = sizeof(testDataStream);
+//   int offset = 0;
+
+//   while (offset < totalLen) {
+//     size_t len = min(chunkSize, totalLen - offset);
+//     // debugSerial.printf("[simulateDataStream] len: %d, radar_rx_len: %d, offset: %d\n",len, radar_rx_len, offset);
+
+//     memcpy(radar_rx_buf + radar_rx_len, testDataStream + offset, len);
+//     radar_rx_len += len;
+//     offset += len;
+
+//     int startIdx = findMagicWord(radar_rx_buf, radar_rx_len);
+//     if (startIdx >= 0 && radar_rx_len - startIdx >= 16) {
+
+//       uint32_t totalPacketLen = bytesToUint32(radar_rx_buf + startIdx + 12);
+//       // debugSerial.print("Frame packet len: ");
+//       // debugSerial.println(totalPacketLen);
+
+//       if (radar_rx_len - startIdx >= totalPacketLen) {
+//         Frame* bufferPtr;
+//         if (xQueueReceive(freeFrameQueue, &bufferPtr, portMAX_DELAY)) {
+//           debugSerial.printf("[simulateDataStream] received bufferPtr: %p\n", bufferPtr);
+//           debugSerial.printf("[simulateDataStream] First byte of bufferPtr: 0x%02X\n", bufferPtr->data[0]);
+//           if (bufferPtr == nullptr) {
+//             debugSerial.println("[simulateDataStream] Error: bufferPtr is NULL");
+//             continue;
+//           }
+//           if (bufferPtr->data == nullptr) {
+//             debugSerial.println("[simulateDataStream] Error: bufferPtr->data is NULL");
+//             continue;
+//           }
+//           if (totalPacketLen > FRAME_BUFFER_SIZE) {
+//             debugSerial.printf("Error: totalPacketLen (%u) exceeds buffer size!\n", totalPacketLen);
+//             continue;
+//           }
+//           memcpy(bufferPtr->data, radar_rx_buf + startIdx, totalPacketLen);
+//           bufferPtr->length = totalPacketLen;
+//           if (bufferPtr->data == NULL) {
+//             debugSerial.println("[simulateDataStream] Warning: bufferPtr->data is NULL before enqueue");
+//           }
+//           xQueueSend(parseFrameQueue, &bufferPtr, portMAX_DELAY);
+//           debugSerial.printf("[simulateDataStream] Enqueued bufferPtr. testidx: %d\n", testidx);
+//           testidx += 1;
+
+//           debugSerial.printf("[simulateDataStream] Pre-shift: startIdx: %d, totalPacketLen: %d, radar_rx_len: %d\n", startIdx, totalPacketLen, radar_rx_len);
+//           shiftBufferLeft(radar_rx_buf, radar_rx_len, startIdx + totalPacketLen);
+//           debugSerial.printf("[simulateDataStream] Post-shift: startIdx: %d, totalPacketLen: %d, radar_rx_len: %d\n", startIdx, totalPacketLen, radar_rx_len);
+//         } else {
+//           debugSerial.println("simulateDataStream failed to receive from freeFrameQueue");
+//         }
+//       }
+//     }
+
+//     delay(1);  // Optional: mimic real-world UART pacing
+//   }
+//   debugSerial.println("Simulation done. Self-deleting");
+//   vTaskDelete(NULL);
+// }
+
+void mssHandlerDirectStreaming(void * params) {
   static uint8_t radar_rx_buf[dataSerial_BUF_SIZE];
   static size_t radar_rx_len = 0;
-  int testidx = 0;
 
-  const int totalLen = sizeof(testDataStream);
-  int offset = 0;
-
-  while (offset < totalLen) {
-    size_t len = min(chunkSize, totalLen - offset);
-    // debugSerial.printf("[simulateDataStream] len: %d, radar_rx_len: %d, offset: %d\n",len, radar_rx_len, offset);
-
-    memcpy(radar_rx_buf + radar_rx_len, testDataStream + offset, len);
-    radar_rx_len += len;
-    offset += len;
-
-    int startIdx = findMagicWord(radar_rx_buf, radar_rx_len);
-    if (startIdx >= 0 && radar_rx_len - startIdx >= 16) {
-
-      uint32_t totalPacketLen = bytesToUint32(radar_rx_buf + startIdx + 12);
-      // debugSerial.print("Frame packet len: ");
-      // debugSerial.println(totalPacketLen);
-
-      if (radar_rx_len - startIdx >= totalPacketLen) {
-        Frame* bufferPtr;
-        if (xQueueReceive(freeFrameQueue, &bufferPtr, portMAX_DELAY)) {
-          debugSerial.printf("[simulateDataStream] received bufferPtr: %p\n", bufferPtr);
-          debugSerial.printf("[simulateDataStream] First byte of bufferPtr: 0x%02X\n", bufferPtr->data[0]);
-          if (bufferPtr == nullptr) {
-            debugSerial.println("[simulateDataStream] Error: bufferPtr is NULL");
-            continue;
-          }
-          if (bufferPtr->data == nullptr) {
-            debugSerial.println("[simulateDataStream] Error: bufferPtr->data is NULL");
-            continue;
-          }
-          if (totalPacketLen > FRAME_BUFFER_SIZE) {
-            debugSerial.printf("Error: totalPacketLen (%u) exceeds buffer size!\n", totalPacketLen);
-            continue;
-          }
-          memcpy(bufferPtr->data, radar_rx_buf + startIdx, totalPacketLen);
-          bufferPtr->length = totalPacketLen;
-          if (bufferPtr->data == NULL) {
-            debugSerial.println("[simulateDataStream] Warning: bufferPtr->data is NULL before enqueue");
-          }
-          xQueueSend(parseFrameQueue, &bufferPtr, portMAX_DELAY);
-          debugSerial.printf("[simulateDataStream] Enqueued bufferPtr. testidx: %d\n", testidx);
-          testidx += 1;
-
-          debugSerial.printf("[simulateDataStream] Pre-shift: startIdx: %d, totalPacketLen: %d, radar_rx_len: %d\n", startIdx, totalPacketLen, radar_rx_len);
-          shiftBufferLeft(radar_rx_buf, radar_rx_len, startIdx + totalPacketLen);
-          debugSerial.printf("[simulateDataStream] Post-shift: startIdx: %d, totalPacketLen: %d, radar_rx_len: %d\n", startIdx, totalPacketLen, radar_rx_len);
-        } else {
-          debugSerial.println("simulateDataStream failed to receive from freeFrameQueue");
+  while(true) {
+    if (radar_started) {
+      const uint32_t chunkSize = 512;
+      size_t len = uart_read_bytes(dataSerial, radar_rx_buf + radar_rx_len, chunkSize, 10/portTICK_PERIOD_MS);
+      if (len > 0) {
+        if (radar_rx_len + len >= dataSerial_BUF_SIZE) {
+          debugSerial.println("Warning: radar_rx_buf overflow. Resetting buffer.");
+          radar_rx_len = 0;
+          continue;
         }
+        radar_rx_len += len;
+        Serial.write(radar_rx_buf, radar_rx_len);
+        radar_rx_len = 0;
       }
+      delay(1);
+    } else {
+      delay(10);
     }
-
-    delay(1);  // Optional: mimic real-world UART pacing
   }
-  debugSerial.println("Simulation done. Self-deleting");
-  vTaskDelete(NULL);
 }
 
 // Checks for magic word, gets packet length, copies complete radar frames into buffer pool
@@ -337,7 +434,7 @@ void mssHandler(void * params) {
 
   while(true) {
     if (radar_started) {
-      const uint32_t chunkSize = 512;
+      const uint32_t chunkSize = 256;
       size_t len = uart_read_bytes(dataSerial, radar_rx_buf + radar_rx_len, chunkSize, 10/portTICK_PERIOD_MS);
       radar_rx_len += len;
       if (radar_rx_len >= dataSerial_BUF_SIZE) {
@@ -346,24 +443,42 @@ void mssHandler(void * params) {
       }
       delay(1);
       int startIdx = findMagicWord(radar_rx_buf, radar_rx_len);
-      if (startIdx >= 0) {
-        shiftBufferLeft(radar_rx_buf, radar_rx_len, startIdx);
-        uint32_t totalPacketLen = bytesToUint32(radar_rx_buf + 12);
+      // debugSerial.printf("[mssHandler] startIdx: %d, radar_rx_len: %d\n", startIdx, radar_rx_len);
+      if (startIdx >= 0 && radar_rx_len - startIdx >= 40) {
+        uint32_t totalPacketLen = bytesToUint32(radar_rx_buf + startIdx + 12);
         debugSerial.print("Frame packet len: ");
         debugSerial.println(totalPacketLen);
-        if (radar_rx_len >= totalPacketLen && radar_rx_len != 0) {
+        if (totalPacketLen < dataSerial_BUF_SIZE && radar_rx_len - startIdx >= totalPacketLen) {
           Frame* bufferPtr;
           if (xQueueReceive(freeFrameQueue, &bufferPtr, portMAX_DELAY)) {
+            debugSerial.println("[mssHandler] freeFrame buffer received");
+            // Protect against nullptrs
+            if (bufferPtr == nullptr) {
+              debugSerial.println("[mssHandler] Error: bufferPtr is NULL");
+              continue;
+            }
+            if (bufferPtr->data == nullptr) {
+              debugSerial.println("[mssHandler] Error: bufferPtr->data is NULL");
+              continue;
+            }
+            if (totalPacketLen > dataSerial_BUF_SIZE) {
+              debugSerial.printf("[mssHandler] Error: totalPacketLen (%u) exceeds buffer size!\n", totalPacketLen);
+              continue;
+            }
+
             memcpy(bufferPtr->data, radar_rx_buf + startIdx, totalPacketLen);
             bufferPtr->length = totalPacketLen;
             xQueueSend(parseFrameQueue, &bufferPtr, portMAX_DELAY);
+            debugSerial.println("[mssHandler] parseFrame buffer sent to parseFrameQueue");
+            shiftBufferLeft(radar_rx_buf, radar_rx_len, startIdx + totalPacketLen);
           } else {
             debugSerial.println("mssHandler failed to receive from freeFrameQueue");
           }
         }
       }
+      debugSerial.printf("mssHandler task stack left: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
     }
-    delay(10);
+    delay(1);
   }
 }
 
@@ -389,7 +504,7 @@ int16_t bytesToSignedInt16(const uint8_t* byte_array) {
 // Helper function for mssHandler
 // Searches through given buffer array for magic word
 int findMagicWord(const uint8_t* buffer, size_t length) {
-  debugSerial.println("findMagicWord called");
+  // debugSerial.println("findMagicWord called");
   const uint8_t magicWord[8] = {2,1,4,3,6,5,8,7};
   if (length < 8) {return -1;}
   for (size_t i = 0; i <= length-8; ++i) {
@@ -445,21 +560,26 @@ void radar_begin(const RADAR_CONFIG &config) {
   setPinModes();
 
   current_config = config;
-  xTaskCreate(parseConfigTask, "parseConfig", 8192, NULL, 1, &parseConfigTaskHandle);
+  xTaskCreate(parseConfigTask, "parseConfig", 4096, NULL, 1, &parseConfigTaskHandle);
+  // while (!configParams.numRangeBins) {delay(10);} // Wait for config to be parsed
 
   // Create data frame queues and fill freeFrameQueue with pointers to frame pool slots
   freeFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
   parseFrameQueue = xQueueCreate(FRAME_POOL_SIZE, sizeof(Frame*));
-  streamQueue = xQueueCreate(5, sizeof(ProcessedFrame));
+  streamQueue = xQueueCreate(5, sizeof(ProcessedFrame*));
 
   for (int i = 0; i < FRAME_POOL_SIZE; i++) {
     frameStructs[i].data = framePool[i];
     frameStructs[i].length = 0;
     Frame* frameStructsPtr = &frameStructs[i];
-    xQueueSend(freeFrameQueue, frameStructsPtr, 0);
+    if (xQueueSend(freeFrameQueue, &frameStructsPtr, 0) != pdPASS) {
+      debugSerial.printf("Failed to enqueue frameStructs[%d]\n", i);
+      continue;
+    }
   }
 
   // Set up Serial lines
+  debugSerial.println("Setting up cliSerial");
   cliSerial.begin(115200, SERIAL_8N1, CLI_RX, CLI_TX);
 
   // Setup dataSerial with ESP-IDF to take advantage of DMA-backed RX
@@ -471,6 +591,7 @@ void radar_begin(const RADAR_CONFIG &config) {
     .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
   };
 
+  debugSerial.println("Setting up dataSerial");
   uart_param_config(dataSerial, &dataSerial_config);
   uart_set_pin(dataSerial, UART_PIN_NO_CHANGE, dataSerial_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   uart_driver_install(dataSerial, dataSerial_BUF_SIZE, 0, 0, NULL, 0);
@@ -483,12 +604,17 @@ void radar_begin(const RADAR_CONFIG &config) {
   digitalWrite(SOP_1, LOW);
   digitalWrite(SOP_2, HIGH);
   
+  xTaskCreate(checkSerialInput, "checkSerialInput", 2048, NULL, 1, &checkSerialTaskHandle);
+  
+  xTaskCreatePinnedToCore(mssHandler, "mssHandler", 4096, NULL, 4, &dataLoggingTaskHandle, 0);
+  xTaskCreatePinnedToCore(parseData, "parseData", 5120, NULL, 2, &dataParsingTaskHandle, 1); // I'm sorry i ever doubted you
+  xTaskCreatePinnedToCore(streamData, "streamData", 3072, NULL, 1, &dataStreamingTaskHandle, 1);
+
+  delay(100); // Wait for tasks to fully initialise
+
   debugSerial.println("Resetting radar...");
   radarReset(0); // Hardware reset
   sendConfig(config);
-  xTaskCreate(mssHandler, "mssHandler", 4096, NULL, 4, &dataLoggingTaskHandle);
-
-  xTaskCreate(checkSerialInput, "checkSerialInput", 2048, NULL, 1, &checkSerialTaskHandle);
   debugSerial.println("You may start sending commands to the MCU via Terminal/Serial Monitor. Type 'help' for the commands list.");
 }
 
@@ -569,6 +695,7 @@ void sendConfig(const RADAR_CONFIG &cfg) {
   }
 
   radar_config = true;
+  radar_started = true;
   if (current_config.name != cfg.name) {current_config = cfg;}
   debugSerial.println("Radar configured and sensor started.");
 }
@@ -577,9 +704,8 @@ void sendConfig(const RADAR_CONFIG &cfg) {
 void parseConfigTask(void * params) {
   debugSerial.println("parseConfig called");
   parseConfig(current_config);
-  UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
-  debugSerial.printf("parseConfig stack remaining: %u bytes\n", watermark * sizeof(StackType_t));
   debugSerial.println("Config parsed.");
+  debugSerial.printf("parseConfigTask stack left: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
   vTaskDelete(NULL);
 }
 
@@ -633,6 +759,7 @@ void parseConfig(const RADAR_CONFIG &cfg) {
   //   debugSerial.print(",");
   // }
   calcConfigParams(cfgIntArr, cfgFloatArr);
+  debugSerial.printf("parseConfig task stack left: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
 }
 
 // Parses individual config line and loads data into int/float arrays. Called by parseConfig
@@ -776,9 +903,8 @@ void stopRadar(bool flushCfg) {
 }
 
 // Handles serial input commands.
-void serialInputHandler(void * pvParameters) {
-  serialHandlerTaskParams* params = (serialHandlerTaskParams*)pvParameters;
-  String input = params->input;
+void serialInputHandler(String &input) {
+
 
   // Functional mode [001]
   if (input == "func") {
@@ -840,6 +966,8 @@ void serialInputHandler(void * pvParameters) {
       'check': prints current board setting
       'hardrst': restarts radar hardware (full hardware & software restart using NRST)
       'softrst': restarts radar software (software-only restart using WARMRST)
+      'start': starts radar sensing
+      'stop': stops radar sensing
       'help': prints full list of commands)");
   }
   else if (input == "start") {
@@ -854,8 +982,9 @@ void serialInputHandler(void * pvParameters) {
     debugSerial.println("Invalid setting. Use 'help' for full commands list.");
   }
 
-  delete params;
-  vTaskDelete(NULL);
+  // delete params;
+  // debugSerial.printf("serialInputHandler task stack left: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
+  // vTaskDelete(NULL);
 }
 
 // Resets the radar. Takes a reset type (0 for hardware, 1 for software) as input.
@@ -873,10 +1002,15 @@ void radarReset(uint8_t reset_type) {
   } 
   else if (reset_type == 1) { // Software reset
     if(!radar_state) {checkRadarState();}
-    stopRadar(true);
+    if (radar_config) {
+      stopRadar(true);
+    } else {
+      stopRadar();
+    }
     digitalWrite(WARMRST, LOW);
     delay(1000); 
     digitalWrite(WARMRST, HIGH); 
+    delay(1000);
     debugSerial.println("Radar software reset completed.");
   }
 }
@@ -888,8 +1022,9 @@ void checkSerialInput(void * params) {
       String input = debugSerial.readStringUntil('\n');
       input.trim(); // Remove any leading/trailing whitespace
 
-      serialHandlerTaskParams* taskParams = new serialHandlerTaskParams{input};
-      xTaskCreate(serialInputHandler, "serialInputHandler", 6144, (void*)taskParams, 2, &serialInputTaskHandle);
+      // serialHandlerTaskParams* taskParams = new serialHandlerTaskParams{input};
+      // xTaskCreate(serialInputHandler, "serialInputHandler", 6144, (void*)taskParams, 2, &serialInputTaskHandle);
+      serialInputHandler(input);
     }
     delay(100);
   }
