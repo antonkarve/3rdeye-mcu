@@ -74,7 +74,7 @@ Next steps / suggestions
 
 License
 -
-This repository currently contains no explicit license file. Add a `LICENSE` if you intend to share or open-source the code.
+This project is licensed under the MIT License — see the `LICENSE` file for details.
 
 Contact / maintainer
 -
